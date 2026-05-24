@@ -76,7 +76,15 @@ buf = struct.pack("<HHHi", FUN1, 0x1000, 0x0002, FUN4)
 
    # Arch Linux
    sudo pacman -S acpi_call
+
+   # Fedora / RHEL
+   # 官方仓库通常不提供预编译包，需从源码手动编译：
+   sudo dnf install kernel-devel dkms
+   git clone https://github.com/nix-community/acpi_call.git
+   cd acpi_call && make && sudo make install
    ```
+
+   > **Fedora 注意**：由于 Fedora 内核通常启用了 Secure Boot 和模块签名验证，加载未签名的自编译模块可能需要额外配置或在 BIOS 中关闭 Secure Boot。
 
 2. **加载模块**
 
@@ -160,6 +168,12 @@ sudo python3 set_charging_wmi.py test
 
 创建 systemd 服务以在每次开机时自动恢复充电限制设置：
 
+> **SELinux 注意（Fedora / RHEL 等）**：如果脚本放在家目录（如 `/home/user/`），通过 systemd 执行时 SELinux 可能会因文件 context 不符而拒绝访问 `/proc/acpi/call`。建议将脚本安装到 `/usr/local/bin/`：
+> ```bash
+> sudo install -m 755 set_charging_wmi.py /usr/local/bin/set-charging-limit
+> ```
+> 然后在 systemd 服务中使用 `/usr/local/bin/set-charging-limit` 替代家目录路径。
+
 ```bash
 sudo nano /etc/systemd/system/xiaomi-charging.service
 ```
@@ -171,7 +185,7 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /path/to/set_charging_wmi.py set 80
+ExecStart=/usr/bin/python3 /usr/local/bin/set-charging-limit sync
 RemainAfterExit=yes
 
 [Install]
@@ -185,6 +199,16 @@ sudo systemctl start xiaomi-charging.service
 ```
 
 > **注意**：充电限制由软件在运行时推送给 EC 硬件，**不会持久化**。系统重启或休眠唤醒后需重新应用。
+
+> **前提：确保 `acpi_call` 模块开机自动加载**
+>
+> systemd 服务执行时 `acpi_call` 模块必须已加载，否则 `/proc/acpi/call` 不存在导致服务失败。需要：
+>
+> 1. 确保模块在内核更新后仍能自动编译（各发行版方式不同，参考 [DKMS 文档](https://github.com/dell/dkms)）
+> 2. 将模块加入开机自动加载：
+>    ```bash
+>    echo "acpi_call" | sudo tee /etc/modules-load.d/acpi_call.conf
+>    ```
 
 ---
 

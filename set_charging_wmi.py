@@ -15,6 +15,7 @@ EC 寄存器映射（由 WMAA 写入）:
   sudo python3 set_charging_wmi.py set 80    # 设置 80% 上限
   sudo python3 set_charging_wmi.py set 100   # 关闭限制（100%）
   sudo python3 set_charging_wmi.py get       # 读取当前阈值
+  sudo python3 set_charging_wmi.py sync      # 恢复上次保存的充电限制
   sudo python3 set_charging_wmi.py test      # 测试 acpi_call 是否可用
 
 依赖: acpi-call-dkms 已安装并加载
@@ -29,6 +30,7 @@ import os
 
 ACPI_METHOD = r"\_SB.PC00.WMID.WMAA"
 ACPI_CALL_DEV = "/proc/acpi/call"
+CHARGING_LIMIT_STATE_FILE = "/var/lib/xiaomi-charging-limit"
 
 # 充电阈值模式码表（与 ssdt25.dsl WMAA Case(0xFB00)/Case(0x1000)/Case(0x02) 对应）
 THRESHOLD_MAP = {
@@ -135,6 +137,14 @@ def cmd_set(pct: int):
         print("[SET] 无法解析返回缓冲，请手动检查结果")
         return
 
+    # 保存状态到文件
+    try:
+        with open(CHARGING_LIMIT_STATE_FILE, "w") as f:
+            f.write(str(pct))
+        print(f"[SET] 状态已保存至 {CHARGING_LIMIT_STATE_FILE}")
+    except Exception as e:
+        print(f"[SET] 警告：无法保存状态: {e}")
+
     # 自动回读验证
     print()
     current = cmd_get()
@@ -184,6 +194,30 @@ def cmd_test():
         sys.exit(1)
 
 
+def cmd_sync():
+    """读取保存的充电限制状态，恢复设置"""
+    if not os.path.exists(CHARGING_LIMIT_STATE_FILE):
+        print(f"[SYNC] 未找到状态文件 {CHARGING_LIMIT_STATE_FILE}")
+        print("[SYNC] 请先使用 'set' 命令设置充电限制")
+        sys.exit(1)
+
+    try:
+        with open(CHARGING_LIMIT_STATE_FILE, "r") as f:
+            content = f.read().strip()
+        pct = int(content)
+        print(f"[SYNC] 读取保存的充电限制: {pct}%")
+    except ValueError:
+        print(f"[SYNC] 错误：状态文件内容无效: {content}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[SYNC] 错误：无法读取状态文件: {e}")
+        sys.exit(1)
+
+    # 调用 cmd_set 恢复设置
+    print(f"[SYNC] 正在恢复充电限制...")
+    cmd_set(pct)
+
+
 def main():
     if os.geteuid() != 0:
         print("错误：需要 root 权限（sudo）")
@@ -215,6 +249,9 @@ def main():
     elif cmd == "get":
         cmd_get()
 
+    elif cmd == "sync":
+        cmd_sync()
+
     elif cmd == "test":
         cmd_test()
 
@@ -225,7 +262,7 @@ def main():
             cmd_set(pct)
         except ValueError:
             print(f"未知命令: {cmd}")
-            print(f"用法: get | set <百分比> | test")
+            print(f"用法: get | set <百分比> | sync | test")
             print(f"支持百分比: {valid}")
             sys.exit(1)
 
