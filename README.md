@@ -212,6 +212,42 @@ sudo systemctl start xiaomi-charging.service
 
 ---
 
+## 卸载 / 移除
+
+**1. 恢复充电无限制**
+
+```bash
+sudo python3 set_charging_wmi.py set 100
+```
+
+**2. 移除 systemd 服务**（如已配置）
+
+```bash
+sudo systemctl disable --now xiaomi-charging.service
+sudo rm /etc/systemd/system/xiaomi-charging.service
+sudo systemctl daemon-reload
+```
+
+**3. 删除状态文件**
+
+```bash
+sudo rm -f /var/lib/xiaomi-charging-limit
+```
+
+**4. 移除脚本**（如已安装到系统目录）
+
+```bash
+sudo rm -f /usr/local/bin/set-charging-limit
+```
+
+**5. 取消模块自动加载**（如已配置）
+
+```bash
+sudo rm -f /etc/modules-load.d/acpi_call.conf
+```
+
+---
+
 ## 许可
 
 本项目代码以 MIT 许可证发布，仅供学习与个人使用。
