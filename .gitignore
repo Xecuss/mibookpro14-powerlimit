@@ -2,3 +2,20 @@
 REVERSE_ENGINEERING_NOTES.md
 REVERSE_ENGINEERING_NOTES_OPTIMIZED.md
 OSDUtility_Analysis.md
+example/
+
+# 内核模块编译产物
+*.o
+*.ko
+.*.cmd
+*.mod
+*.mod.c
+*.mod.o
+*.order
+*.symvers
+.tmp_versions/
+modules.builtin
+modules.builtin.modinfo
+Module.symvers
+modules.order
+.module-common.o
