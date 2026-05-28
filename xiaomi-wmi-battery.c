@@ -14,6 +14,7 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/dmi.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/power_supply.h>
@@ -95,10 +96,40 @@ static const struct xmwmi_thresh_entry {
 struct xiaomi_wmi {
 	struct wmi_device *wdev;
 	struct mutex lock; /* serialises WMAA calls */
+	/*
+	 * Set by xmwmi_battery_add() if device_create_file fails.  Checked
+	 * immediately after devm_battery_hook_register() in probe, which calls
+	 * add_battery synchronously for all already-present batteries before
+	 * returning, so reading this field is race-free.
+	 */
+	int hook_err;
 };
 
-/* Module-level pointer; only one such device can be present at a time. */
+/*
+ * Module-level pointer to the single active WMI device.
+ * A second probe() call is explicitly refused (see xmwmi_wmi_probe).
+ */
 static struct xiaomi_wmi *xmwmi_data;
+
+/*
+ * DMI whitelist: only hardware where the mode code table has been verified
+ * against the shipped ACPI firmware (ssdt25.dsl, XMCC XMCC1806).
+ * Pass force=1 to override on unlisted hardware at your own risk.
+ */
+static const struct dmi_system_id xmwmi_dmi_table[] = {
+	{
+		.ident = "Xiaomi Book Pro 14",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR,   "XIAOMI"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "Xiaomi Book Pro 14"),
+		},
+	},
+	{ }
+};
+
+static bool force;
+module_param(force, bool, 0444);
+MODULE_PARM_DESC(force, "Load on hardware not in the DMI whitelist (unsafe)");
 
 /* -------------------------------------------------------------------------
  * Low-level WMI helper
@@ -253,8 +284,25 @@ static DEVICE_ATTR_RW(charge_control_end_threshold);
 static int xmwmi_battery_add(struct power_supply *bat,
 			     struct acpi_battery_hook *hook)
 {
-	return device_create_file(&bat->dev,
-				  &dev_attr_charge_control_end_threshold);
+	int err;
+
+	err = device_create_file(&bat->dev,
+				 &dev_attr_charge_control_end_threshold);
+	if (err) {
+		dev_err(&bat->dev,
+			"Failed to create charge_control_end_threshold: %d\n",
+			err);
+		/*
+		 * Propagate the error so probe() can detect it after
+		 * devm_battery_hook_register() returns.  The framework will
+		 * call remove_battery for any battery that already succeeded
+		 * and then unregister the hook, but it does not surface the
+		 * error through the registration call itself.
+		 */
+		if (xmwmi_data)
+			xmwmi_data->hook_err = err;
+	}
+	return err;
 }
 
 static int xmwmi_battery_remove(struct power_supply *bat,
@@ -264,6 +312,13 @@ static int xmwmi_battery_remove(struct power_supply *bat,
 	return 0;
 }
 
+/*
+ * This hook attaches the attribute to every BAT* device enumerated by the
+ * ACPI battery driver.  Note: the WMI protocol carries no per-battery
+ * selector, so charge_control_end_threshold is effectively a platform-level
+ * control regardless of which BAT device is written.  The Xiaomi Book Pro 14
+ * has a single battery (BAT0), so this distinction is moot in practice.
+ */
 static struct acpi_battery_hook xmwmi_battery_hook = {
 	.add_battery    = xmwmi_battery_add,
 	.remove_battery = xmwmi_battery_remove,
@@ -279,6 +334,28 @@ static int xmwmi_wmi_probe(struct wmi_device *wdev, const void *ctx)
 	struct xiaomi_wmi *data;
 	int pct, err;
 
+	/* Risk 3: refuse a second simultaneous instance. */
+	if (xmwmi_data) {
+		dev_err(&wdev->dev, "Only one instance supported; refusing second probe\n");
+		return -EBUSY;
+	}
+
+	/*
+	 * Risk 1: restrict write path to hardware with a verified mode code
+	 * table.  Other machines may expose the same GUID with different
+	 * firmware semantics, leading to incorrect EC writes.
+	 */
+	if (!dmi_check_system(xmwmi_dmi_table)) {
+		if (!force) {
+			dev_err(&wdev->dev,
+				"Hardware not in DMI whitelist; refusing to load "
+				"(pass force=1 to override)\n");
+			return -ENODEV;
+		}
+		dev_warn(&wdev->dev,
+			 "Hardware not in DMI whitelist -- loading anyway (force=1)\n");
+	}
+
 	data = devm_kzalloc(&wdev->dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
@@ -287,7 +364,7 @@ static int xmwmi_wmi_probe(struct wmi_device *wdev, const void *ctx)
 	if (err)
 		return err;
 
-	data->wdev  = wdev;
+	data->wdev = wdev;
 	dev_set_drvdata(&wdev->dev, data);
 	xmwmi_data = data;
 
@@ -300,7 +377,27 @@ static int xmwmi_wmi_probe(struct wmi_device *wdev, const void *ctx)
 		return err;
 	}
 
-	battery_hook_register(&xmwmi_battery_hook);
+	/*
+	 * Use the devm variant so the hook lifetime is tied to the WMI device.
+	 * devm_battery_hook_register() calls add_battery synchronously for all
+	 * already-present batteries (via battery_hook_calibrate) before
+	 * returning; if add_battery fails the framework unregisters the hook
+	 * internally but still returns 0 here.  We therefore check data->hook_err
+	 * afterwards to catch that silent failure path.
+	 */
+	err = devm_battery_hook_register(&wdev->dev, &xmwmi_battery_hook);
+	if (err) {
+		dev_err(&wdev->dev, "Failed to register battery hook: %d\n", err);
+		xmwmi_data = NULL;
+		return err;
+	}
+	if (data->hook_err) {
+		dev_err(&wdev->dev,
+			"Battery attribute creation failed: %d\n",
+			data->hook_err);
+		xmwmi_data = NULL;
+		return data->hook_err;
+	}
 
 	dev_info(&wdev->dev,
 		 "Xiaomi WMI charging control ready (current threshold: %d%%)\n",
@@ -310,7 +407,7 @@ static int xmwmi_wmi_probe(struct wmi_device *wdev, const void *ctx)
 
 static void xmwmi_wmi_remove(struct wmi_device *wdev)
 {
-	battery_hook_unregister(&xmwmi_battery_hook);
+	/* battery hook is automatically unregistered by devm cleanup */
 	xmwmi_data = NULL;
 }
 
