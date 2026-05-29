@@ -4,7 +4,7 @@
 
 审查对象：[xiaomi-wmi-battery.c](xiaomi-wmi-battery.c)
 
-结论：模块在当前环境中可以完成构建。原有 battery 路径的 1 到 4 项风险已修复或注释说明，但新增的 performance mode / platform_profile 实现引入了 2 项新的中风险问题，当前仍待处理。构建依旧零警告（pahole/BTF 提示与本模块无关）。
+结论：模块在当前环境中可以完成构建。当前审查中识别出的 1 到 6 项风险均已修复或按机型条件做了明确说明；本轮复查未发现新的静态实现问题。构建依旧零警告（pahole/BTF 提示与本模块无关）。
 
 ## 已完成的检查
 
@@ -69,51 +69,41 @@
 - 已添加代码注释：WMI 协议无电池编号参数，阈值控制为平台级；Xiaomi Book Pro 14 实机仅有 BAT0，多电池歧义在此机型上不构成实际问题。
 - 不做代码修改：只注册到 BAT0 需要 `power_supply_get_by_name`，引入额外复杂度，收益不大。
 
-### 5. 中风险：platform_profile 回读路径未兼容 beast 模式，合法当前状态会被误报为错误
+### 5. ~~中风险~~：platform_profile 回读路径未兼容 beast 模式，合法当前状态会被误报为错误 ✅ 已修复
 
-涉及位置：
+涉及位置（修复后）：
 
-- [xiaomi-wmi-battery.c](xiaomi-wmi-battery.c#L272-L305)（性能模式映射表与 `xmwmi_get_perf()`）
-- [test_perf_mode_wmi.py](test_perf_mode_wmi.py#L41-L47)（验证脚本中的有效模式定义）
+- [xiaomi-wmi-battery.c](xiaomi-wmi-battery.c#L263-L315)（性能模式映射表与 `xmwmi_get_perf()`）
+- [test_perf_mode_wmi.py](test_perf_mode_wmi.py#L40-L51)（验证脚本中的有效模式定义，已包含 `beast`）
 
-问题说明：
+修复方式：
 
-- 驱动注释明确写到固件还存在 `beast`（`0x0004`）模式，并说明它语义上接近 `turbo` / `PLATFORM_PROFILE_PERFORMANCE`。
-- 但当前 `xmwmi_perf_table[]` 只包含 `0x000A`、`0x0002`、`0x0009`、`0x0003`，`xmwmi_get_perf()` 完全依赖该表进行回读映射。
-- 因此一旦固件当前返回 `0x0004`，`xmwmi_get_perf()` 会打印 `Unknown perf mode code` 并返回 `-ERANGE`，导致读取 `/sys/firmware/acpi/platform_profile` 失败。
+- `xmwmi_get_perf()` 在常规映射表之外，显式把 `beast=0x0004` 视为合法固件状态并映射到 `PLATFORM_PROFILE_PERFORMANCE`。
+- 这样即使当前机器是通过热键、Windows 或厂商软件切到 `beast`，Linux 侧读取 `platform_profile` 也不会因未知模式码而失败。
+- `test_perf_mode_wmi.py` 里的模式定义本来就已包含 `beast`，脚本与驱动现在保持一致。
 
-影响：
+复查结论：
 
-- 当前性能模式本身是合法状态，但用户态会看到读取失败，而不是当前 profile。
-- 如果用户通过热键、Windows、厂商守护进程或其他通道切到 `beast`，Linux 侧的新接口会立即退化为不可读。
+- 这条回读失败路径已经消除。
+- 现有实现仍然没有把 `beast` 暴露成独立可写 profile，但这属于接口设计选择，不再是读取正确性问题。
 
-建议修改：
+### 6. ~~中风险~~：probe 未验证性能模式 WMI 路径可达性，却直接宣称 platform_profile 已启用 ✅ 已修复
 
-- 即使不想把 `beast` 暴露为独立可写选项，`xmwmi_get_perf()` 也至少应把 `0x0004` 映射到 `PLATFORM_PROFILE_PERFORMANCE`。
-- 如果后续希望保留该状态的可区分性，可考虑把它作为 hidden choice / 内部别名处理，但不应让合法回读直接失败。
+- 涉及位置（修复后）：
 
-### 6. 中风险：probe 未验证性能模式 WMI 路径可达性，却直接宣称 platform_profile 已启用
+- [xiaomi-wmi-battery.c](xiaomi-wmi-battery.c#L456-L560)（probe 主路径）
+- [xiaomi-wmi-battery.c](xiaomi-wmi-battery.c#L526-L559)（性能模式路径探测与降级处理）
 
-涉及位置：
+- 修复方式：
 
-- [xiaomi-wmi-battery.c](xiaomi-wmi-battery.c#L286-L305)（`xmwmi_get_perf()`）
-- [xiaomi-wmi-battery.c](xiaomi-wmi-battery.c#L446-L529)（probe 中的平台配置注册与 ready 日志）
+- probe 现在会在注册 `platform_profile` 之前先执行一次 `xmwmi_get_perf()`。
+- 如果性能模式 WMI 子路径不可达或返回不可识别值，驱动会打印 `platform_profile not registered`，然后以“仅充电阈值接口可用”的降级模式继续加载。
+- 只有在 `xmwmi_get_perf()` 成功后，才会调用 `devm_platform_profile_register()` 并打印 `platform_profile enabled`。
 
-问题说明：
+- 复查结论：
 
-- 当前 probe 只调用了一次 `xmwmi_get_threshold()` 来验证充电阈值 WMI 路径，然后就直接注册 `platform_profile` 并打印 `platform_profile enabled`。
-- 但新增性能模式接口实际依赖的是另一条 WMI 子路径（`FUN2=0x0800`）；probe 阶段没有执行过一次 `xmwmi_get_perf()`，因此没有验证这条路径是否可达、返回码是否可映射。
-- `devm_platform_profile_register()` 只负责注册 class 设备，并不会替代驱动完成底层 WMI 功能自检。
-
-影响：
-
-- 只要出现“充电阈值路径可用，但性能模式路径不可用”或“当前性能模式返回未映射码”的情况，模块仍会 probe 成功并宣称接口已启用。
-- 实际失败会推迟到用户第一次读取或设置 `/sys/firmware/acpi/platform_profile` 时暴露，属于新增接口上的“假成功”。
-
-建议修改：
-
-- 在 probe 中于注册 `platform_profile` 前先执行一次 `xmwmi_get_perf()`，只有验证成功后再注册并打印 enabled。
-- 如果希望允许模块在“仅电池阈值可用”场景下降级工作，则应在日志中明确说明 `platform_profile` 未启用，而不是统一打印 ready。
+- “平台配置接口假成功”的问题已经消除。
+- 当前实现的降级行为也更合理：充电阈值路径正常时，模块不会因为性能模式路径不可用而整体探测失败。
 
 ## 状态汇总
 
@@ -123,11 +113,12 @@
 | 2 | 中 | ✅ 已修复 | `hook_err` 字段传播 `add_battery` 失败 |
 | 3 | 中 | ✅ 已修复 | probe 入口 `-EBUSY` 拒绝第二实例 |
 | 4 | 低 | ✅ 已注释 | 代码注释说明平台级控制语义 |
-| 5 | 中 | 待修复 | `xmwmi_get_perf()` 需兼容 `beast=0x0004` 回读 |
-| 6 | 中 | 待修复 | probe 需先验证性能模式 WMI 路径，再注册 `platform_profile` |
+| 5 | 中 | ✅ 已修复 | `xmwmi_get_perf()` 已兼容 `beast=0x0004` 回读 |
+| 6 | 中 | ✅ 已修复 | probe 已先验证性能模式 WMI 路径，再决定是否注册 `platform_profile` |
 
 ## 备注
 
 - 当前构建通过（零警告，仅 pahole/BTF 提示与本模块无关）。
 - `add_battery` 在框架中是同步调用，`hook_err` 传播路径无竞态。
-- 未在真实硬件上做热插拔、多实例、并发卸载，以及 `beast` 模式或性能模式失效路径测试；上述结论以静态分析和当前验证脚本为主。
+- `beast` 模式回读兼容和 `platform_profile` 预探测逻辑已在代码路径上闭合，本轮静态复查未发现新的功能性问题。
+- 未在真实硬件上做热插拔、多实例、并发卸载，以及性能模式失效路径的主动故障注入测试；上述结论以静态分析和当前验证脚本为主。

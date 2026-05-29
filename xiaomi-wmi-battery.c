@@ -300,6 +300,16 @@ static int xmwmi_get_perf(enum platform_profile_option *profile_out)
 		}
 	}
 
+	/*
+	 * beast (0x0004) is an AC-only turbo variant not exposed as a
+	 * writable choice, but it is a valid firmware state; map it to
+	 * PERFORMANCE so reads do not fail when this mode is active.
+	 */
+	if (code == 0x0004) {
+		*profile_out = PLATFORM_PROFILE_PERFORMANCE;
+		return 0;
+	}
+
 	dev_warn(&xmwmi_data->wdev->dev,
 		 "Unknown perf mode code 0x%04x from firmware\n", code);
 	return -ERANGE;
@@ -511,6 +521,26 @@ static int xmwmi_wmi_probe(struct wmi_device *wdev, const void *ctx)
 			data->hook_err);
 		xmwmi_data = NULL;
 		return data->hook_err;
+	}
+
+/*
+	 * Verify the performance-mode WMI sub-path (FUN2=0x0800) is reachable
+	 * before announcing platform_profile.  A failure here leaves the
+	 * charging interface intact; the module still loads successfully.
+	 */
+	{
+		enum platform_profile_option tmp;
+
+		err = xmwmi_get_perf(&tmp);
+	}
+	if (err) {
+		dev_warn(&wdev->dev,
+			 "Performance mode GET failed (%d); platform_profile not registered\n",
+			 err);
+		dev_info(&wdev->dev,
+			 "Xiaomi WMI ready (charge threshold: %d%%)\n",
+			 pct);
+		return 0;
 	}
 
 	err = PTR_ERR_OR_ZERO(devm_platform_profile_register(&wdev->dev,
