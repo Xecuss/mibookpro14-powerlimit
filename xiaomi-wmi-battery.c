@@ -1,22 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Xiaomi Laptop WMI Charging Threshold Driver
+ * Xiaomi Laptop WMI Driver
  *
- * Controls battery charge_control_end_threshold via the WMI method GUID
- *   B60BFB48-3E5B-49E4-A0E9-8CFFE1B3434B
- * which maps to ACPI method \_SB.PC00.WMID.WMAA in ssdt25.dsl (XMCC XMCC1806).
+ * Controls battery charge_control_end_threshold and performance modes via
+ * WMI method GUID B60BFB48-3E5B-49E4-A0E9-8CFFE1B3434B, which maps to
+ * ACPI method \_SB.PC00.WMID.WMAA in ssdt25.dsl (XMCC XMCC1806).
  *
- * Once loaded, /sys/class/power_supply/BAT0/charge_control_end_threshold
- * becomes available for read/write (supported values: 40 50 60 70 80 90 100).
+ * Exposes:
+ *   /sys/class/power_supply/BAT0/charge_control_end_threshold
+ *       read/write; supported values: 40 50 60 70 80 90 100
+ *   /sys/firmware/acpi/platform_profile
+ *       read/write; supported values: low-power quiet balanced performance
  *
- * Based on reverse engineering of XiaomiPCManager 5.8.0.57 and validated
- * with acpi_call on hardware.
+ * Charging protocol: reverse-engineered from XiaomiPCManager 5.8.0.57.
+ * Performance mode protocol: discovered via Meow-Box (GPL-3.0,
+ *   github.com/leehyukshuai/Meow-Box), verified with acpi_call on hardware.
  */
 
 #include <linux/acpi.h>
 #include <linux/dmi.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/platform_profile.h>
 #include <linux/power_supply.h>
 #include <linux/wmi.h>
 #include <acpi/battery.h>
@@ -26,14 +31,16 @@
 #define XMWMI_METHOD_ID		1
 
 /* FUN1: call direction */
-#define XMWMI_FUN1_SET		0xFB00u	/* write charging threshold */
-#define XMWMI_FUN1_GET		0xFA00u	/* read  charging threshold */
+#define XMWMI_FUN1_GET		0xFA00u
+#define XMWMI_FUN1_SET		0xFB00u
 
 /* FUN2: subsystem selector */
-#define XMWMI_FUN2_BATTERY	0x1000u
+#define XMWMI_FUN2_BATTERY	0x1000u	/* charging threshold */
+#define XMWMI_FUN2_PERF		0x0800u	/* performance mode */
 
-/* FUN3: feature selector (charging threshold) */
-#define XMWMI_FUN3_CHG_THRESH	0x0002u
+/* FUN3: feature / mode selector */
+#define XMWMI_FUN3_CHG_THRESH	0x0002u	/* charging threshold */
+#define XMWMI_FUN3_PERF_GET	0x0000u	/* perf GET; SET carries mode code in FUN3 */
 
 /* SGER: firmware success code in the return buffer */
 #define XMWMI_SGER_OK		0x8000u
@@ -43,9 +50,9 @@
  *
  *   Offset  Size  Field
  *     0       2   FUN1  – direction (GET / SET)
- *     2       2   FUN2  – subsystem  (0x1000 = battery)
- *     4       2   FUN3  – feature    (0x0002 = charge threshold)
- *     6       4   FUN4  – mode code  (SET: mode, GET: 0)
+ *     2       2   FUN2  – subsystem  (XMWMI_FUN2_BATTERY or XMWMI_FUN2_PERF)
+ *     4       2   FUN3  – feature; for perf SET this carries the mode code
+ *     6       4   FUN4  – mode code for charging SET, 0 otherwise
  */
 struct xmwmi_args {
 	__le16 fun1;
@@ -55,16 +62,19 @@ struct xmwmi_args {
 } __packed;
 
 /*
- * Return buffer layout from WMAA (10 bytes, little-endian):
+ * Return buffer layout from WMAA (firmware returns 32 bytes; we inspect
+ * only the first 10), little-endian:
  *
  *   Offset  Size  Field
  *     0       2   SGER  – status (0x8000 = OK)
- *     2       4   (reserved / other fields)
- *     6       4   FRD1  – returned data (current mode code on GET)
+ *     2       2   echo  – FUN2 echoed back by firmware
+ *     4       2   data0 – returned u16 (perf mode code on GET perf)
+ *     6       4   frd1  – returned u32 (charge limit code on GET charge)
  */
 struct xmwmi_ret {
 	__le16 sger;
-	u8     reserved[4];
+	__le16 echo;
+	__le16 data0;
 	__le32 frd1;
 } __packed;
 
@@ -136,19 +146,23 @@ MODULE_PARM_DESC(force, "Load on hardware not in the DMI whitelist (unsafe)");
  * ---------------------------------------------------------------------- */
 
 /**
- * xmwmi_call() - Execute a WMAA call and optionally return FRD1.
- * @fun1:    Direction flag (XMWMI_FUN1_GET or XMWMI_FUN1_SET).
- * @fun4:    Mode code for SET, 0 for GET.
- * @out_val: If non-NULL, receives the FRD1 field from the return buffer.
+ * xmwmi_invoke() - Execute a WMAA call with explicit FUN parameters.
+ * @fun1:      Direction flag (XMWMI_FUN1_GET or XMWMI_FUN1_SET).
+ * @fun2:      Subsystem selector (XMWMI_FUN2_BATTERY or XMWMI_FUN2_PERF).
+ * @fun3:      Feature selector; for perf-mode SET this carries the mode code.
+ * @fun4:      Mode code for charging SET, 0 otherwise.
+ * @out_data0: If non-NULL, receives data0 (offset 4, u16) from the response.
+ * @out_frd1:  If non-NULL, receives frd1  (offset 6, u32) from the response.
  *
  * Returns 0 on success, -EIO on ACPI or firmware error.
  */
-static int xmwmi_call(u16 fun1, u32 fun4, u32 *out_val)
+static int xmwmi_invoke(u16 fun1, u16 fun2, u16 fun3, u32 fun4,
+			u16 *out_data0, u32 *out_frd1)
 {
 	struct xmwmi_args args = {
 		.fun1 = cpu_to_le16(fun1),
-		.fun2 = cpu_to_le16(XMWMI_FUN2_BATTERY),
-		.fun3 = cpu_to_le16(XMWMI_FUN3_CHG_THRESH),
+		.fun2 = cpu_to_le16(fun2),
+		.fun3 = cpu_to_le16(fun3),
 		.fun4 = cpu_to_le32(fun4),
 	};
 	struct acpi_buffer in  = { sizeof(args), &args };
@@ -191,8 +205,10 @@ static int xmwmi_call(u16 fun1, u32 fun4, u32 *out_val)
 		goto free_out;
 	}
 
-	if (out_val)
-		*out_val = le32_to_cpu(ret->frd1);
+	if (out_data0)
+		*out_data0 = le16_to_cpu(ret->data0);
+	if (out_frd1)
+		*out_frd1 = le32_to_cpu(ret->frd1);
 
 free_out:
 	kfree(out.pointer);
@@ -208,7 +224,8 @@ static int xmwmi_get_threshold(int *pct_out)
 	u32 mode;
 	int err, i;
 
-	err = xmwmi_call(XMWMI_FUN1_GET, 0, &mode);
+	err = xmwmi_invoke(XMWMI_FUN1_GET, XMWMI_FUN2_BATTERY,
+			   XMWMI_FUN3_CHG_THRESH, 0, NULL, &mode);
 	if (err)
 		return err;
 
@@ -230,12 +247,109 @@ static int xmwmi_set_threshold(int pct)
 
 	for (i = 0; i < ARRAY_SIZE(xmwmi_thresh_table); i++) {
 		if (xmwmi_thresh_table[i].pct == pct)
-			return xmwmi_call(XMWMI_FUN1_SET,
-					  xmwmi_thresh_table[i].mode, NULL);
+			return xmwmi_invoke(XMWMI_FUN1_SET, XMWMI_FUN2_BATTERY,
+					    XMWMI_FUN3_CHG_THRESH,
+					    xmwmi_thresh_table[i].mode,
+					    NULL, NULL);
 	}
 
 	return -EINVAL;
 }
+
+/* -------------------------------------------------------------------------
+ * Performance mode get / set helpers
+ * ---------------------------------------------------------------------- */
+
+/*
+ * Mapping between Linux platform_profile options and firmware mode codes
+ * (FUN2=0x0800, verified on Xiaomi Book Pro 14 2026 via acpi_call).
+ *
+ *   battery (0x000A): minimal CPU/GPU limits, fan silent
+ *   silent  (0x0002): quiet fan, moderate performance limits
+ *   smart   (0x0009): firmware auto-tunes for balanced use (default)
+ *   turbo   (0x0003): maximum sustained performance, active cooling
+ *
+ * The firmware also has "beast" (0x0004, AC-only turbo variant) which
+ * maps to the same platform_profile level as turbo; it is omitted here
+ * to keep the set of exposed choices unambiguous.
+ */
+static const struct xmwmi_perf_entry {
+	enum platform_profile_option profile;
+	u16                          code;
+} xmwmi_perf_table[] = {
+	{ PLATFORM_PROFILE_LOW_POWER,   0x000A },
+	{ PLATFORM_PROFILE_QUIET,       0x0002 },
+	{ PLATFORM_PROFILE_BALANCED,    0x0009 },
+	{ PLATFORM_PROFILE_PERFORMANCE, 0x0003 },
+};
+
+static int xmwmi_get_perf(enum platform_profile_option *profile_out)
+{
+	u16 code;
+	int err, i;
+
+	err = xmwmi_invoke(XMWMI_FUN1_GET, XMWMI_FUN2_PERF,
+			   XMWMI_FUN3_PERF_GET, 0, &code, NULL);
+	if (err)
+		return err;
+
+	for (i = 0; i < ARRAY_SIZE(xmwmi_perf_table); i++) {
+		if (xmwmi_perf_table[i].code == code) {
+			*profile_out = xmwmi_perf_table[i].profile;
+			return 0;
+		}
+	}
+
+	dev_warn(&xmwmi_data->wdev->dev,
+		 "Unknown perf mode code 0x%04x from firmware\n", code);
+	return -ERANGE;
+}
+
+static int xmwmi_set_perf(enum platform_profile_option profile)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(xmwmi_perf_table); i++) {
+		if (xmwmi_perf_table[i].profile == profile)
+			return xmwmi_invoke(XMWMI_FUN1_SET, XMWMI_FUN2_PERF,
+					    xmwmi_perf_table[i].code, 0,
+					    NULL, NULL);
+	}
+
+	return -EOPNOTSUPP;
+}
+
+/* -------------------------------------------------------------------------
+ * platform_profile interface – exposes performance modes via
+ * /sys/firmware/acpi/platform_profile
+ * ---------------------------------------------------------------------- */
+
+static int xmwmi_pp_probe(void *drvdata, unsigned long *choices)
+{
+	set_bit(PLATFORM_PROFILE_LOW_POWER,   choices);
+	set_bit(PLATFORM_PROFILE_QUIET,       choices);
+	set_bit(PLATFORM_PROFILE_BALANCED,    choices);
+	set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
+	return 0;
+}
+
+static int xmwmi_pp_get(struct device *dev,
+			enum platform_profile_option *profile)
+{
+	return xmwmi_get_perf(profile);
+}
+
+static int xmwmi_pp_set(struct device *dev,
+			enum platform_profile_option profile)
+{
+	return xmwmi_set_perf(profile);
+}
+
+static const struct platform_profile_ops xmwmi_pp_ops = {
+	.probe       = xmwmi_pp_probe,
+	.profile_get = xmwmi_pp_get,
+	.profile_set = xmwmi_pp_set,
+};
 
 /* -------------------------------------------------------------------------
  * sysfs attribute: charge_control_end_threshold
@@ -399,8 +513,19 @@ static int xmwmi_wmi_probe(struct wmi_device *wdev, const void *ctx)
 		return data->hook_err;
 	}
 
+	err = PTR_ERR_OR_ZERO(devm_platform_profile_register(&wdev->dev,
+							     "xiaomi-wmi",
+							     data,
+							     &xmwmi_pp_ops));
+	if (err) {
+		dev_err(&wdev->dev,
+			"Failed to register platform profile: %d\n", err);
+		xmwmi_data = NULL;
+		return err;
+	}
+
 	dev_info(&wdev->dev,
-		 "Xiaomi WMI charging control ready (current threshold: %d%%)\n",
+		 "Xiaomi WMI ready (charge threshold: %d%%, platform_profile enabled)\n",
 		 pct);
 	return 0;
 }
@@ -428,5 +553,5 @@ static struct wmi_driver xmwmi_driver = {
 module_wmi_driver(xmwmi_driver);
 
 MODULE_AUTHOR("xecus");
-MODULE_DESCRIPTION("Xiaomi Laptop WMI charging threshold control");
+MODULE_DESCRIPTION("Xiaomi Laptop WMI battery and performance mode control");
 MODULE_LICENSE("GPL");
