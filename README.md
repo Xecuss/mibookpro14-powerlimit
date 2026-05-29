@@ -8,6 +8,14 @@
 
 ---
 
+## 内核模块方案
+
+本项目同时提供原生 Linux **内核模块**（`xiaomi-wmi-battery`），通过标准 sysfs 接口控制充电阈值与性能模式，无需 `acpi_call` 依赖，可被 TLP、GNOME 电源管理等工具直接识别。
+
+👉 **[查看内核模块完整使用说明 →](KERNEL_MOD_README.md)**
+
+---
+
 ## 适用机型
 
 **小米 Book Pro 14**（已验证）
