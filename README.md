@@ -258,4 +258,16 @@ sudo rm -f /etc/modules-load.d/acpi_call.conf
 
 ## 许可
 
-本项目代码以 MIT 许可证发布，仅供学习与个人使用。
+本仓库采用**按文件分许可**（per-file licensing）方式，各文件许可证以其文件头 `SPDX-License-Identifier` 或下表为准：
+
+| 文件 | 许可证 | 说明 |
+|------|--------|------|
+| `xiaomi-wmi-battery.c`、`Makefile` | **GPL-2.0** | Linux 内核模块需链接内核 GPL-only 导出符号，必须声明 GPL。 |
+| `test_perf_mode_wmi.py` | **GPL-2.0** | 与内核模块协议一致。 |
+| `set_charging_wmi.py`、本文档等 | **MIT** | 纯用户态脚本/文档，与内核无链接关系。 |
+
+MIT 与 GPL-2.0 兼容（MIT 代码可被 GPL 项目引用），两个组件作为独立文件共存符合常见开源实践。
+
+性能模式协议参考自 [Meow-Box](https://github.com/leehyukshuai/Meow-Box)（GPL-3.0）。
+
+> 仅供学习与个人使用，使用风险自负。

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """
 小米笔记本 Linux 充电阈值控制脚本
 通过 acpi_call 内核模块调用 ACPI WMI 方法 WMAA
