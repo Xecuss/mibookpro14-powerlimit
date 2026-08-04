@@ -156,15 +156,20 @@ Fedora 内核默认启用模块签名验证。使用自编译模块时需要：
    mkdir -p "$MOK_DIR"
    openssl req -new -x509 -newkey rsa:2048 \
        -keyout "$MOK_DIR/MOK.priv" \
-       -out    "$MOK_DIR/MOK.der" \
-       -days 3650 -subj "/CN=Local Module Signing/"
+       -outform DER -out "$MOK_DIR/MOK.der" \
+       -nodes -days 3650 -subj "/CN=Local Module Signing/"
 
    # 注册到 MOK
    sudo mokutil --import "$MOK_DIR/MOK.der"
-   # 重启后在 MOK 管理界面确认注册
+   # 此处会提示输入一个动态密码，请牢记该密码。
+   # 重启系统后，会出现 MOK 管理界面（蓝屏的 Shim UEFI key management 界⾯）：
+   # 1. 选择 "Enroll MOK"
+   # 2. 选择 "Continue"
+   # 3. 选择 "Yes"
+   # 4. 输入刚才设置的密码进行确认，然后重启。
 
    # 对已安装模块签名
-   sudo /usr/src/linux-headers-$(uname -r)/scripts/sign-file \
+   sudo /usr/src/kernels/$(uname -r)/scripts/sign-file \
        sha256 "$MOK_DIR/MOK.priv" "$MOK_DIR/MOK.der" \
        /lib/modules/$(uname -r)/updates/xiaomi-wmi-battery.ko
    ```
