@@ -1,195 +1,76 @@
-# 小米笔记本 Linux 充电阈值控制
+# Xiaomi Book Pro 14 Linux Battery Charge Limit
 
-通过直接调用 ACPI WMI 方法，在 Linux 下控制小米笔记本充电上限。
+[简体中文](README.zh-CN.md)
 
-> **免责声明**：本脚本仅在作者自己的 **小米 Book Pro 14** 上验证通过。在其他机型上使用可能导致不可预期的行为，使用风险自负。
->
-> **AI 声明**：本项目的逆向工程分析由 **Claude Sonnet 4.6** 完成。
+Set a battery charging threshold on the Xiaomi Book Pro 14 from Linux. This project provides a native kernel module with standard sysfs interfaces and a standalone Python script that calls the laptop's ACPI WMI firmware.
 
----
+The author tested both methods on a Xiaomi Book Pro 14. Other Xiaomi laptops with similar firmware are untested. The module and script send commands to the embedded controller (EC), and incompatible firmware can behave unpredictably. Use at your own risk. Claude Sonnet 4.6 contributed the reverse-engineering analysis.
 
-## 内核模块方案
-
-本项目同时提供原生 Linux **内核模块**（`xiaomi-wmi-battery`），通过标准 sysfs 接口控制充电阈值与性能模式，无需 `acpi_call` 依赖，可被 TLP、GNOME 电源管理等工具直接识别。
-
-👉 **[查看内核模块完整使用说明 →](KERNEL_MOD_README.md)**
-
----
-
-## 适用机型
-
-**小米 Book Pro 14**（已验证）
-
-其他搭载相同 EC 固件的小米笔记本可能也适用，但未经测试。
-
----
-
-## WMI 接口说明
-
-### WMI 设备
-
-| 字段 | 值 |
-|------|----|
-| **GUID** | `B60BFB48-3E5B-49E4-A0E9-8CFFE1B3434B` |
-| **ACPI 路径** | `\_SB.PC00.WMID.WMAA` |
-| **Instance** | `0` |
-| **MethodID** | `1` |
-
-### 输入缓冲格式（10 字节，小端序）
-
-```
-偏移  大小   字段   说明
-0x00  2字节  FUN1   功能大类：0xFB00 = 写入 / 0xFA00 = 读取
-0x02  2字节  FUN2   子系统：0x1000 = 电池
-0x04  2字节  FUN3   功能编号：0x0002 = 充电阈值
-0x06  4字节  FUN4   参数值（模式码，见下表）
-```
-
-Python 构造方式：
-```python
-import struct
-buf = struct.pack("<HHHi", FUN1, 0x1000, 0x0002, FUN4)
-```
-
-### 充电模式码（FUN4）
-
-| FUN4 | 充电上限 | EC 寄存器 LONL bit0 | EC 寄存器 HBDA |
-|------|---------|---------------------|----------------|
-| `0x00` | 100%（关闭限制） | 0 | 100 |
-| `0x04` | 90% | 1 | 90 |
-| `0x01` | 80% | 1 | 80 |
-| `0x05` | 70% | 1 | 70 |
-| `0x06` | 60% | 1 | 60 |
-| `0x07` | 50% | 1 | 50 |
-| `0x08` | 40% | 1 | 40 |
-
-### 输出缓冲格式
-
-| 偏移 | 大小 | 字段 | 说明 |
-|------|------|------|------|
-| 0x00 | 2字节 | SGER | 状态码：`0x8000` = 成功，其他值 = 失败 |
-| 0x06 | 4字节 | FRD1 | 当前模式码（仅 GET 时有意义） |
-
-**成功标志**：返回缓冲前两字节（小端序 `uint16`）== `0x8000`
-
----
-
-## 前置条件
-
-1. **安装 `acpi_call` 内核模块**
-
-   ```bash
-   # Debian / Ubuntu
-   sudo apt install acpi-call-dkms
-
-   # Arch Linux
-   sudo pacman -S acpi_call
-
-   # Fedora / RHEL
-   # 官方仓库通常不提供预编译包，需从源码手动编译：
-   sudo dnf install kernel-devel dkms
-   git clone https://github.com/nix-community/acpi_call.git
-   cd acpi_call && make && sudo make install
-   ```
-
-   > **Fedora 注意**：由于 Fedora 内核通常启用了 Secure Boot 和模块签名验证，加载未签名的自编译模块可能需要额外配置或在 BIOS 中关闭 Secure Boot。
-
-2. **加载模块**
-
-   ```bash
-   sudo modprobe acpi_call
-   ```
-
-3. **验证模块已加载**（应有 `/proc/acpi/call` 文件）
-
-   ```bash
-   ls /proc/acpi/call
-   ```
-
----
-
-## 安装
+## Get the source
 
 ```bash
-git clone <repo-url>
-cd xiaomi-power-test
+git clone https://github.com/Xecuss/mibookpro14-powerlimit.git
+cd mibookpro14-powerlimit
 ```
 
----
+## Native kernel module
 
-## 使用说明
+The `xiaomi-wmi-battery` module exposes the battery charge threshold and platform performance profiles through standard Linux interfaces. It can integrate with tools such as TLP and GNOME Power and has no `acpi_call` dependency.
 
-所有操作均需 **root 权限**（`sudo`）。
-
-### ⚠️ 重要：操作前必须先验证 GET
-
-**在执行任何 `set` 操作之前，必须先运行 `get` 并确认返回值为 `100%`**。
-若当前值不是 100%，说明硬件环境或 ACPI 路径可能不匹配，请勿继续设置。
+The module checks for the DMI vendor `XIAOMI` and product name `Xiaomi Book Pro 14`. To build it, install a compiler, Make, and the headers or development package for your running kernel. From the repository root:
 
 ```bash
+make
+sudo insmod xiaomi-wmi-battery.ko
+```
+
+Once the module loads, you can read or change the charge limit and inspect the available profiles:
+
+```bash
+cat /sys/class/power_supply/BAT0/charge_control_end_threshold
+echo 80 | sudo tee /sys/class/power_supply/BAT0/charge_control_end_threshold
+cat /sys/firmware/acpi/platform_profile_choices
+```
+
+The [kernel module guide (Chinese)](KERNEL_MOD_README.md) covers distribution dependencies, DKMS installation, Secure Boot and signing, performance profiles, and module removal. A kernel update may require a rebuild. Charge thresholds are applied to the EC at runtime and may need to be reapplied after power loss or resume.
+
+## Python script with acpi_call
+
+Install Python 3.10 or newer and the `acpi_call` kernel module. Debian and Ubuntu package it as `acpi-call-dkms`, and Arch Linux packages it as `acpi_call`. If your distribution lacks a package for your kernel, use the [acpi_call source and build instructions](https://github.com/nix-community/acpi_call). Secure Boot may require a signed module.
+
+Load the module and read the current threshold on the supported laptop:
+
+```bash
+sudo modprobe acpi_call
+ls /proc/acpi/call
 sudo python3 set_charging_wmi.py get
 ```
 
-预期输出（确认为 100% 后方可进行 set）：
-```
-[GET] ACPI 调用: \_SB.PC00.WMID.WMAA 0 1 {...}
-[GET] 返回值: { 0x00, 0x80, ... }
-[GET] [OK]  当前充电上限: 100%
-```
-
-### 读取当前阈值
+**Before the first write on a system with the factory charging configuration, confirm that `get` reports `[OK]` and a threshold of `100%`.** If it fails or reports an unexpected value, stop and check the model and firmware before writing. The script prints its status messages in Chinese.
 
 ```bash
-sudo python3 set_charging_wmi.py get
-```
-
-### 设置充电上限
-
-```bash
-# 设置为 80%（推荐，兼顾续航与电池健康）
 sudo python3 set_charging_wmi.py set 80
-
-# 支持的值：100 / 90 / 80 / 70 / 60 / 50 / 40
-sudo python3 set_charging_wmi.py set 100   # 恢复无限制
+sudo python3 set_charging_wmi.py get
+sudo python3 set_charging_wmi.py set 100
 ```
 
-设置成功后脚本会自动回读验证：
-```
-[SET] 充电上限 → 80%  (FUN4=0x01)
-[SET] ACPI 调用: \_SB.PC00.WMID.WMAA 0 1 {...}
-[SET] 返回值: { 0x00, 0x80, ... }
-[SET] [OK] 写入成功  SGER=0x8000
-...
-[GET] [OK]  当前充电上限: 80%
-[SET] 验证通过：充电上限已确认为 80%
-```
+The supported limits are `40`, `50`, `60`, `70`, `80`, `90`, and `100` percent. Setting `100` disables the limit. After a successful write, the script saves the setting in `/var/lib/xiaomi-charging-limit` and reads the threshold back for verification. Use `sudo python3 set_charging_wmi.py test` to check that the `acpi_call` interface is available.
 
-### 测试环境是否就绪
+### Reapply the limit at boot
+
+After setting a limit with the script, use its `sync` command to reapply the saved value. For systemd, install the script at a system path and configure `acpi_call` to load at boot. A system path also avoids SELinux restrictions on executing a script from a home directory on Fedora and similar systems.
 
 ```bash
-sudo python3 set_charging_wmi.py test
+sudo install -m 755 set_charging_wmi.py /usr/local/bin/set-charging-limit
+echo acpi_call | sudo tee /etc/modules-load.d/acpi_call.conf
 ```
 
----
-
-## 开机自动应用（可选）
-
-创建 systemd 服务以在每次开机时自动恢复充电限制设置：
-
-> **SELinux 注意（Fedora / RHEL 等）**：如果脚本放在家目录（如 `/home/user/`），通过 systemd 执行时 SELinux 可能会因文件 context 不符而拒绝访问 `/proc/acpi/call`。建议将脚本安装到 `/usr/local/bin/`：
-> ```bash
-> sudo install -m 755 set_charging_wmi.py /usr/local/bin/set-charging-limit
-> ```
-> 然后在 systemd 服务中使用 `/usr/local/bin/set-charging-limit` 替代家目录路径。
-
-```bash
-sudo nano /etc/systemd/system/xiaomi-charging.service
-```
+Create `/etc/systemd/system/xiaomi-charging.service` with these contents:
 
 ```ini
 [Unit]
 Description=Xiaomi Battery Charging Protection
-After=network.target
+After=systemd-modules-load.service
 
 [Service]
 Type=oneshot
@@ -202,72 +83,36 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable xiaomi-charging.service
-sudo systemctl start xiaomi-charging.service
+sudo systemctl enable --now xiaomi-charging.service
 ```
 
-> **注意**：充电限制由软件在运行时推送给 EC 硬件，**不会持久化**。系统重启或休眠唤醒后需重新应用。
+To remove the script setup, first restore the 100% limit. If you created the service, disable it with `sudo systemctl disable --now xiaomi-charging.service`, remove its unit file, and run `sudo systemctl daemon-reload`. You can then remove the installed script and `/var/lib/xiaomi-charging-limit`. Remove `/etc/modules-load.d/acpi_call.conf` if you added it solely for this script.
 
-> **前提：确保 `acpi_call` 模块开机自动加载**
->
-> systemd 服务执行时 `acpi_call` 模块必须已加载，否则 `/proc/acpi/call` 不存在导致服务失败。需要：
->
-> 1. 确保模块在内核更新后仍能自动编译（各发行版方式不同，参考 [DKMS 文档](https://github.com/dell/dkms)）
-> 2. 将模块加入开机自动加载：
->    ```bash
->    echo "acpi_call" | sudo tee /etc/modules-load.d/acpi_call.conf
->    ```
+## WMI reference
 
----
+The Python script calls instance `0`, method ID `1`, at ACPI path `\_SB.PC00.WMID.WMAA`. The WMI GUID is `B60BFB48-3E5B-49E4-A0E9-8CFFE1B3434B`.
 
-## 卸载 / 移除
+| Offset | Size | Field | Description |
+| --- | --- | --- | --- |
+| `0x00` | 2 bytes | `FUN1` | `0xFA00` reads and `0xFB00` writes |
+| `0x02` | 2 bytes | `FUN2` | `0x1000` selects the battery subsystem |
+| `0x04` | 2 bytes | `FUN3` | `0x0002` selects the charging threshold |
+| `0x06` | 4 bytes | `FUN4` | Mode code for writes |
 
-**1. 恢复充电无限制**
+The request uses 10 little-endian bytes, packed as `<HHHi` in Python. In the response, the 16-bit status at offset `0x00` is `0x8000` on success. A read returns the current 32-bit mode code at offset `0x06`.
 
-```bash
-sudo python3 set_charging_wmi.py set 100
-```
+| Mode code | Charge limit | EC LONL bit 0 | EC HBDA |
+| --- | ---: | ---: | ---: |
+| `0x00` | 100% | 0 | 100 |
+| `0x04` | 90% | 1 | 90 |
+| `0x01` | 80% | 1 | 80 |
+| `0x05` | 70% | 1 | 70 |
+| `0x06` | 60% | 1 | 60 |
+| `0x07` | 50% | 1 | 50 |
+| `0x08` | 40% | 1 | 40 |
 
-**2. 移除 systemd 服务**（如已配置）
+## License and credits
 
-```bash
-sudo systemctl disable --now xiaomi-charging.service
-sudo rm /etc/systemd/system/xiaomi-charging.service
-sudo systemctl daemon-reload
-```
+Licensing is per file. The kernel module, its Makefile, and `test_perf_mode_wmi.py` use GPL-2.0. The charging script and this README use MIT. See the individual files for their SPDX identifiers where present.
 
-**3. 删除状态文件**
-
-```bash
-sudo rm -f /var/lib/xiaomi-charging-limit
-```
-
-**4. 移除脚本**（如已安装到系统目录）
-
-```bash
-sudo rm -f /usr/local/bin/set-charging-limit
-```
-
-**5. 取消模块自动加载**（如已配置）
-
-```bash
-sudo rm -f /etc/modules-load.d/acpi_call.conf
-```
-
----
-
-## 许可
-
-本仓库采用**按文件分许可**（per-file licensing）方式，各文件许可证以其文件头 `SPDX-License-Identifier` 或下表为准：
-
-| 文件 | 许可证 | 说明 |
-|------|--------|------|
-| `xiaomi-wmi-battery.c`、`Makefile` | **GPL-2.0** | Linux 内核模块需链接内核 GPL-only 导出符号，必须声明 GPL。 |
-| `test_perf_mode_wmi.py` | **GPL-2.0** | 与内核模块协议一致。 |
-| `set_charging_wmi.py`、本文档等 | **MIT** | 纯用户态脚本/文档，与内核无链接关系。 |
-
-MIT 与 GPL-2.0 兼容（MIT 代码可被 GPL 项目引用），两个组件作为独立文件共存符合常见开源实践。
-
-性能模式协议参考自 [Meow-Box](https://github.com/leehyukshuai/Meow-Box)（GPL-3.0）。
-
-> 仅供学习与个人使用，使用风险自负。
+The performance-mode protocol is based on work by [Meow-Box](https://github.com/leehyukshuai/Meow-Box) (GPL-3.0).
